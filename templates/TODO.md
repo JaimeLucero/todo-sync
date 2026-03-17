@@ -14,7 +14,7 @@ Follow the format below to ensure items parse correctly.
 <!-- Completed items go here. Mark with [x] instead of [ ] -->
 <!-- Format: - [x] Your completed task description -->
 
----
+## Reference
 
 ### How to Add Todos
 
@@ -37,22 +37,22 @@ Replace `123` with your actual GitHub issue number.
 
 ### Example Format (Reference Only)
 
-This is what your TODO.md should look like after adding items:
+After adding real todos, your file structure should look similar to:
 
-```markdown
+```
 ## Open
-
-- [ ] Implement user authentication
-- [ ] Add dark mode support <!-- issue:45 -->
-- [ ] Fix login bug <!-- issue:32 -->
+- [_] Implement user authentication
+- [_] Add dark mode support
+- [_] Fix login bug
 
 ## Done
-
-- [x] Setup project repository
-- [x] Create initial documentation <!-- issue:1 -->
+- [X] Setup project repository
+- [X] Create initial documentation
 ```
 
-> **Note:** The examples above are just for reference. Start with empty `## Open` and `## Done` sections above and add your own items.
+(Replace `[_]` with `[ ]` for unchecked items in your actual file)
+
+**Important:** Only add items to ## Open and ## Done that you actually want to sync to GitHub!
 
 ### Important Rules
 
