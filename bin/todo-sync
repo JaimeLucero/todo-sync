@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# todo-sync CLI entry point
+# Works for both development (scripts/sync.py) and Homebrew installs (../libexec/sync.py)
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# Locate sync.py relative to this script
+if [[ -f "$SCRIPT_DIR/../libexec/sync.py" ]]; then
+  # Homebrew installation path
+  SYNC_SCRIPT="$SCRIPT_DIR/../libexec/sync.py"
+else
+  # Development installation path
+  SYNC_SCRIPT="$SCRIPT_DIR/../scripts/sync.py"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# Argument parsing
+# ─────────────────────────────────────────────────────────────────────────
+
+FIRST_ARG="${1:-}"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Pre-flight checks (skipped for help, version, and init)
+# ─────────────────────────────────────────────────────────────────────────
+
+if [[ "$FIRST_ARG" != "--help" && "$FIRST_ARG" != "-h" && \
+      "$FIRST_ARG" != "--version" && "$FIRST_ARG" != "help" && \
+      "$FIRST_ARG" != "init" ]]; then
+  # These commands need: gh CLI, gh auth, and git repo
+
+  if ! command -v gh &>/dev/null; then
+    echo "Error: gh CLI not found."
+    echo "Install from: https://cli.github.com"
+    exit 1
+  fi
+
+  if ! gh auth status &>/dev/null 2>&1; then
+    echo "Error: Not authenticated with GitHub."
+    echo "Run: gh auth login"
+    exit 1
+  fi
+
+  if ! git rev-parse --git-dir &>/dev/null 2>&1; then
+    echo "Error: Not inside a git repository."
+    exit 1
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# Check Python is available
+# ─────────────────────────────────────────────────────────────────────────
+
+if ! command -v "$PYTHON_BIN" &>/dev/null; then
+  echo "Error: python3 not found."
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# Delegate to Python
+# ─────────────────────────────────────────────────────────────────────────
+
+exec "$PYTHON_BIN" "$SYNC_SCRIPT" "$@"

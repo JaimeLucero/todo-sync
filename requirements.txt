@@ -1,0 +1,5 @@
+# Development and testing dependencies only
+# sync.py has NO runtime dependencies (uses built-in Python + gh CLI)
+
+pytest>=7.0
+pytest-mock>=3.10

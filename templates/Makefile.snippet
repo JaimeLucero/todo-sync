@@ -1,0 +1,15 @@
+TODO_FILE ?= TODO.md
+
+.PHONY: todo-sync todo-pull todo-push
+
+## Bidirectional sync: TODO.md <-> GitHub Issues
+todo-sync:
+	todo-sync sync --todo $(TODO_FILE)
+
+## Pull only: GitHub Issues → TODO.md
+todo-pull:
+	todo-sync pull --todo $(TODO_FILE)
+
+## Push only: TODO.md → GitHub Issues
+todo-push:
+	todo-sync push --todo $(TODO_FILE)
