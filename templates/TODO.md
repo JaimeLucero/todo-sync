@@ -1,6 +1,8 @@
 # TODO
 
-This file syncs with GitHub Issues. Follow the format below to ensure items parse correctly.
+**⚠️ Warning:** This file syncs with GitHub Issues. Only add items you actually want to sync!
+
+Follow the format below to ensure items parse correctly.
 
 ## Open
 
@@ -33,7 +35,9 @@ Replace `123` with your actual GitHub issue number.
 - [x] Your completed task description
 ```
 
-### Examples
+### Example Format (Reference Only)
+
+This is what your TODO.md should look like after adding items:
 
 ```markdown
 ## Open
@@ -47,6 +51,8 @@ Replace `123` with your actual GitHub issue number.
 - [x] Setup project repository
 - [x] Create initial documentation <!-- issue:1 -->
 ```
+
+> **Note:** The examples above are just for reference. Start with empty `## Open` and `## Done` sections above and add your own items.
 
 ### Important Rules
 
