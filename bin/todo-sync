@@ -4,7 +4,7 @@ set -euo pipefail
 # todo-sync CLI entry point
 # Works for both development (scripts/sync.py) and Homebrew installs (../libexec/sync.py)
 
-SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Locate sync.py relative to this script
