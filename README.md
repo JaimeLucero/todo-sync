@@ -16,7 +16,7 @@ A CLI tool for bidirectional syncing between `TODO.md` and GitHub Issues. Instal
 
 ```bash
 # One-time setup
-brew tap yourname/todo-sync
+brew tap jaimelucero/todo-sync
 brew install todo-sync
 
 # Verify installation
@@ -26,7 +26,7 @@ todo-sync --version
 ### From source (development)
 
 ```bash
-git clone https://github.com/yourname/todo-sync.git
+git clone https://github.com/jaimelucero/todo-sync.git
 cd todo-sync
 chmod +x bin/todo-sync
 export PATH="$(pwd)/bin:$PATH"
