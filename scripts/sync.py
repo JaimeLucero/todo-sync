@@ -42,6 +42,7 @@ class IssueRecord:
     number: int
     title: str
     state: str  # "open" or "closed"
+    body: str = ""  # issue body/description
 
 
 class ClaudeClient:
@@ -524,6 +525,32 @@ class GitHubClient:
         except GitHubError as e:
             raise GitHubError(f"Failed to edit issue #{number}: {e}")
 
+    def fetch_issue(self, number: int) -> IssueRecord:
+        """Fetch a single issue with full details including body."""
+        try:
+            output = self._gh(
+                "issue", "view",
+                str(number),
+                "--json", "number,title,state,body"
+            )
+        except GitHubError as e:
+            raise GitHubError(f"Failed to fetch issue #{number}: {e}")
+
+        # Expected format: "number\ttitle\tstate\tbody"
+        # But body can contain tabs, so we split carefully
+        parts = output.split('\t', 3)  # Split on first 3 tabs only
+        if len(parts) < 3:
+            raise GitHubError(f"Could not parse issue #{number} response")
+
+        try:
+            number = int(parts[0])
+            title = parts[1]
+            state = parts[2]
+            body = parts[3] if len(parts) > 3 else ""
+            return IssueRecord(number=number, title=title, state=state, body=body)
+        except (ValueError, IndexError) as e:
+            raise GitHubError(f"Could not parse issue #{number} response: {e}")
+
 
 class SyncEngine:
     """Orchestrate bidirectional sync between TODO.md and GitHub Issues."""
@@ -568,9 +595,36 @@ class SyncEngine:
                         item.issue_id = issue.number
                         self._log("CREATED", f"Issue #{issue.number}: {item.text}")
 
-                # Item is checked, issue is open: close it
+                # Existing item: sync title/body changes and manage state
                 if item.issue_id in issue_map:
                     issue = issue_map[item.issue_id]
+
+                    # Check if title or body changed (only if item has description or subtasks)
+                    if item.description or item.subtasks:
+                        if self.dry_run:
+                            pass  # Log changes below
+                        else:
+                            full_issue = self.github.fetch_issue(item.issue_id)
+                            new_body = self._build_issue_body(item)
+
+                            title_changed = item.text != full_issue.title
+                            body_changed = new_body.strip() != (full_issue.body or "").strip()
+
+                            if title_changed or body_changed:
+                                self.github.edit_issue(
+                                    item.issue_id,
+                                    title=item.text if title_changed else None,
+                                    body=new_body if body_changed else None
+                                )
+                                self._log("UPDATED", f"Issue #{item.issue_id}: content synced")
+                    else:
+                        # Simple item without description/subtasks: check title anyway
+                        if item.text != issue.title:
+                            if not self.dry_run:
+                                self.github.edit_issue(item.issue_id, title=item.text)
+                                self._log("UPDATED", f"Issue #{item.issue_id}: title synced")
+
+                    # Handle open/close state
                     if item.checked and issue.state == "open":
                         if self.dry_run:
                             self._log("CLOSE", f"Issue #{item.issue_id}: {item.text}")
@@ -612,8 +666,29 @@ class SyncEngine:
                         self.parser.append_item(section, issue.title, issue.number)
                         self._log("APPENDED", f"Issue #{issue.number} to {section.upper()}")
                 else:
-                    # Issue exists in TODO.md: sync state
+                    # Issue exists in TODO.md: sync state and content
                     item = next(i for i in items if i.issue_id == issue.number)
+
+                    # Sync title and body changes from GitHub
+                    title_changed = issue.title != item.text
+                    if title_changed:
+                        if self.dry_run:
+                            self._log("UPDATE", f"Issue #{issue.number} title from GitHub")
+                        else:
+                            item.text = issue.title
+                            self._log("UPDATED", f"Issue #{issue.number}: title from GitHub")
+
+                    # Sync body (description + subtasks) from GitHub
+                    if not self.dry_run:
+                        full_issue = self.github.fetch_issue(issue.number)
+                        gh_description, gh_subtasks = self._parse_issue_body(full_issue.body or "")
+
+                        body_changed = (gh_description != item.description or
+                                       gh_subtasks != item.subtasks)
+                        if body_changed:
+                            item.description = gh_description
+                            item.subtasks = gh_subtasks
+                            self._log("UPDATED", f"Issue #{issue.number}: body from GitHub")
 
                     # Issue closed, item unchecked: check it
                     if issue.state == "closed" and not item.checked:
@@ -652,6 +727,38 @@ class SyncEngine:
                 body_lines.append(f"- {checkbox} {subtask.text}")
 
         return '\n'.join(body_lines)
+
+    def _parse_issue_body(self, body: str) -> tuple[str, list[Subtask]]:
+        """Parse GitHub issue body into description and subtasks.
+
+        Returns: (description, subtasks)
+        """
+        if not body:
+            return "", []
+
+        lines = body.split('\n')
+        description_lines = []
+        subtasks = []
+        in_description = True
+
+        for line in lines:
+            # Check if this line is a subtask checkbox
+            match = re.match(r'^- \[([ x])\] (.+)$', line)
+            if match:
+                in_description = False
+                checked = match.group(1) == 'x'
+                text = match.group(2)
+                subtasks.append(Subtask(text=text, checked=checked))
+            elif not in_description or line.strip():  # Still in description or non-empty line
+                if in_description:
+                    description_lines.append(line)
+
+        # Clean up trailing empty lines from description
+        while description_lines and not description_lines[-1].strip():
+            description_lines.pop()
+
+        description = '\n'.join(description_lines)
+        return description, subtasks
 
     def _log(self, action: str, detail: str) -> None:
         """Log an action."""
@@ -1113,7 +1220,7 @@ def main() -> None:
     parser.add_argument(
         "--version",
         action="version",
-        version="todo-sync 1.1.0"
+        version="todo-sync 1.1.1"
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
