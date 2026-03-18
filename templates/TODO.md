@@ -18,7 +18,7 @@ Follow the format below to ensure items parse correctly.
 
 ### How to Add Todos
 
-**Format for new items:**
+**Basic format for new items:**
 ```
 - [ ] Your task description
 ```
@@ -35,22 +35,57 @@ Replace `123` with your actual GitHub issue number.
 - [x] Your completed task description
 ```
 
-### Example Format (Reference Only)
+**With description and subtasks:**
+```
+- [ ] Your task description <!-- issue:123 -->
+  > Add context about this task here. Can be multiple lines.
+  - [ ] First subtask or criterion
+  - [ ] Second subtask or criterion
+```
 
-After adding real todos, your file structure should look similar to:
+Descriptions use indented `> ` lines, and subtasks use indented `- [ ]` checkboxes.
+
+**CLI Commands:**
+- `todo-sync comment <issue-id> "<message>"` — Add a comment to an issue
+- `todo-sync assign <issue-id>` — Assign an issue to yourself
+
+### Advanced Format: Descriptions and Subtasks
+
+Items can include descriptions and subtasks for more context:
 
 ```
 ## Open
-- [_] Implement user authentication
-- [_] Add dark mode support
-- [_] Fix login bug
+- [ ] Implement user authentication <!-- issue:1 -->
+  > Allow users to sign in via OAuth2. Priority: High
+  - [ ] Add OAuth2 integration
+  - [ ] Create session management
+  - [x] Design login UI
+
+- [ ] Fix login bug <!-- issue:2 -->
+  > Users cannot log in on Safari. Regression from v2.3.
+  - [ ] Reproduce on Safari 17
+  - [ ] Check auth token expiry
+  - [ ] Write regression test
 
 ## Done
-- [X] Setup project repository
-- [X] Create initial documentation
+- [x] Setup project repository
+- [x] Create initial documentation
 ```
 
-(Replace `[_]` with `[ ]` for unchecked items in your actual file)
+### Example Format (Reference Only - Simple Format)
+
+For simple todos without descriptions or subtasks:
+
+```
+## Open
+- [ ] Implement user authentication
+- [ ] Add dark mode support
+- [ ] Fix login bug
+
+## Done
+- [x] Setup project repository
+- [x] Create initial documentation
+```
 
 **Important:** Only add items to ## Open and ## Done that you actually want to sync to GitHub!
 
