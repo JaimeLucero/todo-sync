@@ -27,6 +27,7 @@ class TodoItem:
     section: str       # "open" or "done"
     description: str = ""  # optional description (multiline context)
     subtasks: list['Subtask'] = dataclasses.field(default_factory=list)  # optional subtasks
+    labels: list[str] = dataclasses.field(default_factory=list)  # optional labels for GitHub issues
 
 
 @dataclasses.dataclass
@@ -141,6 +142,7 @@ class TodoParser:
     CHECKBOX_RE = re.compile(r'^- \[([ x])\] (.+?)(?:\s*<!--\s*issue:(\d+)\s*-->)?\s*$')
     SECTION_RE = re.compile(r'^##\s+(.+)$')
     DESCRIPTION_RE = re.compile(r'^\s+>\s(.*)$')  # indented > for description
+    LABELS_RE = re.compile(r'^\s+labels:\s*(.+?)\s*$')  # indented labels metadata
     SUBTASK_RE = re.compile(r'^\s+- \[([ x])\] (.+)$')  # indented subtask
 
     def __init__(self, path: str):
@@ -158,10 +160,22 @@ class TodoParser:
 
         items = []
         current_section = None
+        in_code_fence = False
         idx = 0
 
         while idx < len(self._lines):
             line = self._lines[idx]
+
+            # Check for code fence (triple backticks)
+            if line.strip().startswith('```'):
+                in_code_fence = not in_code_fence
+                idx += 1
+                continue
+
+            # Skip parsing while inside code fence
+            if in_code_fence:
+                idx += 1
+                continue
 
             # Check for section heading
             section_match = self.SECTION_RE.match(line)
@@ -173,19 +187,23 @@ class TodoParser:
                 elif "done" in heading:
                     current_section = "done"
                     self._section_lines["done"] = idx
+                else:
+                    # Reset section for unknown headings (e.g., ## Reference)
+                    current_section = None
                 idx += 1
                 continue
 
-            # Check for checkbox
-            checkbox_match = self.CHECKBOX_RE.match(line)
+            # Check for checkbox (only if current_section is set)
+            checkbox_match = self.CHECKBOX_RE.match(line) if current_section else None
             if checkbox_match:
                 checked = checkbox_match.group(1) == 'x'
                 text = checkbox_match.group(2)
                 issue_id = int(checkbox_match.group(3)) if checkbox_match.group(3) else None
                 item_line_index = idx
 
-                # Collect description and subtasks
+                # Collect description, labels, and subtasks
                 description_lines = []
+                labels = []
                 subtasks = []
                 idx += 1
 
@@ -199,6 +217,15 @@ class TodoParser:
                         idx += 1
                         continue
 
+                    # Check for labels line (must come after description, before subtasks)
+                    labels_match = self.LABELS_RE.match(next_line)
+                    if labels_match:
+                        labels_str = labels_match.group(1)
+                        # Parse comma-separated labels, strip whitespace
+                        labels = [label.strip() for label in labels_str.split(',') if label.strip()]
+                        idx += 1
+                        continue
+
                     # Check for subtask line
                     subtask_match = self.SUBTASK_RE.match(next_line)
                     if subtask_match:
@@ -208,7 +235,7 @@ class TodoParser:
                         idx += 1
                         continue
 
-                    # Not a description or subtask, break out
+                    # Not a description, labels, or subtask, break out
                     break
 
                 items.append(TodoItem(
@@ -218,7 +245,8 @@ class TodoParser:
                     line_index=item_line_index,
                     section=current_section or "unknown",
                     description='\n'.join(description_lines),
-                    subtasks=subtasks
+                    subtasks=subtasks,
+                    labels=labels
                 ))
             else:
                 idx += 1
@@ -248,13 +276,13 @@ class TodoParser:
                     item = items[item_idx]
                     # Write the checkbox line
                     new_lines.append(self._format_item_lines(item)[0])
-                    # Write description and subtasks
+                    # Write description, labels, and subtasks
                     new_lines.extend(self._format_item_lines(item)[1:])
                     item_idx += 1
                 else:
                     new_lines.append(line)
-            elif self.DESCRIPTION_RE.match(line) or self.SUBTASK_RE.match(line):
-                # Skip old description/subtask lines; they'll be rewritten with the item
+            elif self.DESCRIPTION_RE.match(line) or self.LABELS_RE.match(line) or self.SUBTASK_RE.match(line):
+                # Skip old description/labels/subtask lines; they'll be rewritten with the item
                 pass
             else:
                 # Keep other lines as-is
@@ -291,9 +319,10 @@ class TodoParser:
             # If it's a checkbox, update insert position
             if self.CHECKBOX_RE.match(line):
                 insert_idx = i + 1
-                # Skip past any description/subtask lines
+                # Skip past any description/labels/subtask lines
                 while insert_idx < len(self._lines) and (
                     self.DESCRIPTION_RE.match(self._lines[insert_idx]) or
+                    self.LABELS_RE.match(self._lines[insert_idx]) or
                     self.SUBTASK_RE.match(self._lines[insert_idx])
                 ):
                     insert_idx += 1
@@ -323,10 +352,10 @@ class TodoParser:
         checkbox_line = item_to_remove.line_index
         remove_count = 1  # Count the checkbox line itself
 
-        # Count how many description and subtask lines follow
+        # Count how many description, labels, and subtask lines follow
         if checkbox_line + 1 < len(self._lines):
             for i in range(checkbox_line + 1, len(self._lines)):
-                if self.DESCRIPTION_RE.match(self._lines[i]) or self.SUBTASK_RE.match(self._lines[i]):
+                if self.DESCRIPTION_RE.match(self._lines[i]) or self.LABELS_RE.match(self._lines[i]) or self.SUBTASK_RE.match(self._lines[i]):
                     remove_count += 1
                 else:
                     break
@@ -345,7 +374,8 @@ class TodoParser:
         return True
 
     def update_item(self, issue_id: int, title: str | None = None, description: str | None = None,
-                   add_subtask: str | None = None, remove_subtask: str | None = None) -> TodoItem | None:
+                   add_subtask: str | None = None, remove_subtask: str | None = None,
+                   labels: list[str] | None = None) -> TodoItem | None:
         """Update an existing item. Returns the updated item or None if not found."""
         items = self.load()
         item = next((i for i in items if i.issue_id == issue_id), None)
@@ -362,6 +392,8 @@ class TodoParser:
             item.subtasks.append(Subtask(text=add_subtask, checked=False))
         if remove_subtask is not None:
             item.subtasks = [s for s in item.subtasks if s.text != remove_subtask]
+        if labels is not None:
+            item.labels = labels
 
         # Write back all items
         self.write_back(items)
@@ -378,7 +410,7 @@ class TodoParser:
 
     @staticmethod
     def _format_item_lines(item: TodoItem) -> list[str]:
-        """Format a TodoItem as multiple lines (checkbox, description, subtasks)."""
+        """Format a TodoItem as multiple lines (checkbox, description, labels, subtasks)."""
         lines = []
         # Format checkbox line
         lines.append(TodoParser._format_line(item.checked, item.text, item.issue_id))
@@ -387,6 +419,11 @@ class TodoParser:
         if item.description:
             for desc_line in item.description.split('\n'):
                 lines.append(f"  > {desc_line}")
+
+        # Format labels line
+        if item.labels:
+            labels_str = ", ".join(item.labels)
+            lines.append(f"  labels: {labels_str}")
 
         # Format subtask lines
         for subtask in item.subtasks:
@@ -441,22 +478,21 @@ class GitHubClient:
         except GitHubError as e:
             raise GitHubError(f"Failed to fetch issues: {e}")
 
-        issues = []
-        for line in output.split('\n'):
-            if not line.strip():
-                continue
-            # Expected format: "123\tIssue Title\topen"
-            parts = line.split('\t')
-            if len(parts) >= 3:
+        try:
+            data = json.loads(output)
+            issues = []
+            for item in data:
                 try:
-                    number = int(parts[0])
-                    title = parts[1]
-                    state = parts[2]
-                    issues.append(IssueRecord(number=number, title=title, state=state))
-                except (ValueError, IndexError):
-                    pass  # Skip malformed lines
-
-        return issues
+                    issues.append(IssueRecord(
+                        number=item["number"],
+                        title=item["title"],
+                        state=item["state"].lower()
+                    ))
+                except (KeyError, ValueError):
+                    pass  # Skip malformed items
+            return issues
+        except json.JSONDecodeError as e:
+            raise GitHubError(f"Failed to parse issues JSON: {e}")
 
     def create_issue(self, title: str, body: str = "") -> IssueRecord:
         """Create a new issue and return the record."""
@@ -536,20 +572,89 @@ class GitHubClient:
         except GitHubError as e:
             raise GitHubError(f"Failed to fetch issue #{number}: {e}")
 
-        # Expected format: "number\ttitle\tstate\tbody"
-        # But body can contain tabs, so we split carefully
-        parts = output.split('\t', 3)  # Split on first 3 tabs only
-        if len(parts) < 3:
-            raise GitHubError(f"Could not parse issue #{number} response")
+        try:
+            data = json.loads(output)
+            return IssueRecord(
+                number=data["number"],
+                title=data["title"],
+                state=data["state"].lower(),
+                body=data.get("body") or ""
+            )
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            raise GitHubError(f"Could not parse issue #{number} response: {e}")
+
+    def get_issue_labels(self, number: int) -> list[str]:
+        """Fetch labels for an issue."""
+        try:
+            output = self._gh(
+                "issue", "view",
+                str(number),
+                "--json", "labels",
+                "--jq", ".labels[].name"
+            )
+        except GitHubError:
+            return []  # Return empty list if fetch fails
+
+        # Output is one label per line
+        if not output.strip():
+            return []
+        return output.strip().split('\n')
+
+    def add_labels(self, number: int, labels: list[str]) -> None:
+        """Add labels to an issue."""
+        if not labels:
+            return
+
+        args = ["issue", "edit", str(number)]
+        for label in labels:
+            args.extend(["--add-label", label])
 
         try:
-            number = int(parts[0])
-            title = parts[1]
-            state = parts[2]
-            body = parts[3] if len(parts) > 3 else ""
-            return IssueRecord(number=number, title=title, state=state, body=body)
-        except (ValueError, IndexError) as e:
-            raise GitHubError(f"Could not parse issue #{number} response: {e}")
+            self._gh(*args)
+        except GitHubError as e:
+            raise GitHubError(f"Failed to add labels to issue #{number}: {e}")
+
+    def remove_labels(self, number: int, labels: list[str]) -> None:
+        """Remove labels from an issue."""
+        if not labels:
+            return
+
+        args = ["issue", "edit", str(number)]
+        for label in labels:
+            args.extend(["--remove-label", label])
+
+        try:
+            self._gh(*args)
+        except GitHubError as e:
+            raise GitHubError(f"Failed to remove labels from issue #{number}: {e}")
+
+    def get_available_labels(self) -> list[str]:
+        """Fetch all available labels in the repository."""
+        try:
+            output = self._gh(
+                "label", "list",
+                "--json", "name",
+                "--jq", ".[] | .name"
+            )
+        except GitHubError:
+            return []
+
+        if not output.strip():
+            return []
+        return output.strip().split('\n')
+
+    def create_label(self, name: str, color: str = "cccccc", description: str = "") -> None:
+        """Create a new label in the repository."""
+        args = ["label", "create", name, "--color", color]
+        if description:
+            args.extend(["--description", description])
+
+        try:
+            self._gh(*args)
+        except GitHubError as e:
+            # Label might already exist, which is fine
+            if "already exists" not in str(e).lower():
+                raise GitHubError(f"Failed to create label '{name}': {e}")
 
 
 class SyncEngine:
@@ -595,6 +700,11 @@ class SyncEngine:
                         item.issue_id = issue.number
                         self._log("CREATED", f"Issue #{issue.number}: {item.text}")
 
+                        # Add labels if present
+                        if item.labels:
+                            self.github.add_labels(item.issue_id, item.labels)
+                            self._log("UPDATED", f"Issue #{item.issue_id}: labels added ({', '.join(item.labels)})")
+
                 # Existing item: sync title/body changes and manage state
                 if item.issue_id in issue_map:
                     issue = issue_map[item.issue_id]
@@ -623,6 +733,20 @@ class SyncEngine:
                             if not self.dry_run:
                                 self.github.edit_issue(item.issue_id, title=item.text)
                                 self._log("UPDATED", f"Issue #{item.issue_id}: title synced")
+
+                    # Sync labels: compare and update
+                    if not self.dry_run:
+                        current_labels = self.github.get_issue_labels(item.issue_id)
+                        labels_to_add = [l for l in item.labels if l not in current_labels]
+                        labels_to_remove = [l for l in current_labels if l not in item.labels]
+
+                        if labels_to_add:
+                            self.github.add_labels(item.issue_id, labels_to_add)
+                            self._log("UPDATED", f"Issue #{item.issue_id}: labels added ({', '.join(labels_to_add)})")
+
+                        if labels_to_remove:
+                            self.github.remove_labels(item.issue_id, labels_to_remove)
+                            self._log("UPDATED", f"Issue #{item.issue_id}: labels removed ({', '.join(labels_to_remove)})")
 
                     # Handle open/close state
                     if item.checked and issue.state == "open":
@@ -689,6 +813,13 @@ class SyncEngine:
                             item.description = gh_description
                             item.subtasks = gh_subtasks
                             self._log("UPDATED", f"Issue #{issue.number}: body from GitHub")
+
+                    # Sync labels from GitHub
+                    if not self.dry_run:
+                        gh_labels = self.github.get_issue_labels(issue.number)
+                        if gh_labels != item.labels:
+                            item.labels = gh_labels
+                            self._log("UPDATED", f"Issue #{issue.number}: labels synced from GitHub")
 
                     # Issue closed, item unchecked: check it
                     if issue.state == "closed" and not item.checked:
@@ -803,8 +934,8 @@ def cmd_init(args) -> None:
     """Initialize TODO.md in the current directory."""
     todo_path = Path(args.todo)
 
-    if todo_path.exists():
-        print(f"⊘ {todo_path} already exists (skipped)")
+    if todo_path.exists() and not args.force:
+        print(f"⊘ {todo_path} already exists (skipped, use --force to overwrite)")
     else:
         # Copy template TODO.md
         template_path = Path(__file__).parent.parent / "templates" / "TODO.md"
@@ -944,6 +1075,75 @@ def cmd_remove(args) -> None:
         sys.exit(1)
 
 
+def cmd_label(args) -> None:
+    """Set labels for a GitHub issue."""
+    try:
+        parser = TodoParser(args.todo)
+        github = GitHubClient()
+        issue_id = args.issue_id
+        labels_str = args.labels
+
+        # Parse labels from comma-separated string
+        new_labels = [l.strip() for l in labels_str.split(',') if l.strip()]
+
+        # Get available labels on GitHub
+        available_labels = github.get_available_labels()
+
+        # Auto-create missing labels
+        missing_labels = [l for l in new_labels if l not in available_labels]
+        if missing_labels:
+            print(f"Creating {len(missing_labels)} new label(s)...")
+            for label in missing_labels:
+                github.create_label(label)
+                print(f"  Created: {label}")
+
+        # Update TODO.md
+        updated_item = parser.update_item(issue_id, labels=new_labels)
+
+        if updated_item is None:
+            print(f"Error: Issue #{issue_id} not found in {args.todo}", file=sys.stderr)
+            sys.exit(1)
+
+        # Get current labels on GitHub and sync
+        current_labels = github.get_issue_labels(issue_id)
+        labels_to_add = [l for l in new_labels if l not in current_labels]
+        labels_to_remove = [l for l in current_labels if l not in new_labels]
+
+        if labels_to_add:
+            github.add_labels(issue_id, labels_to_add)
+        if labels_to_remove:
+            github.remove_labels(issue_id, labels_to_remove)
+
+        print(f"✓ Issue #{issue_id} labels updated")
+        if new_labels:
+            print(f"  Labels: {', '.join(new_labels)}")
+        else:
+            print(f"  Labels: (none)")
+
+    except (FileNotFoundError, GitHubError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_labels(args) -> None:
+    """List all available labels in the repository."""
+    try:
+        github = GitHubClient()
+        labels = github.get_available_labels()
+
+        if not labels:
+            print("No labels found in this repository")
+            return
+
+        print(f"Available labels ({len(labels)}):")
+        for label in sorted(labels):
+            print(f"  - {label}")
+
+    except GitHubError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_add(args) -> None:
     """Add a new ticket to GitHub and TODO.md."""
     try:
@@ -1018,19 +1218,20 @@ def cmd_help(args) -> None:
 
   Initialize a TODO.md file in the current directory with a basic structure
   (Open and Done sections). Safe to run multiple times—won't overwrite an
-  existing TODO.md.
+  existing TODO.md unless --force is specified.
 
   Usage:
     todo-sync init [options]
 
   Options:
     --with-makefile    Also inject Makefile targets (make todo-sync, etc.)
+    --force            Overwrite existing TODO.md (reinitialize with template)
     --todo FILE        Path to TODO.md (default: TODO.md)
 
   Example:
     todo-sync init
     todo-sync init --with-makefile
-    todo-sync init --todo tasks/TODO.md
+    todo-sync init --force --todo tasks/TODO.md
 """,
         "push": """
   push — Push TODO.md items to GitHub Issues
@@ -1149,6 +1350,35 @@ def cmd_help(args) -> None:
     todo-sync remove 42
     todo-sync remove 42 --close
 """,
+        "label": """
+  label — Set labels for a GitHub issue
+
+  Sets labels for an issue in both TODO.md and GitHub. Replaces any existing labels.
+  Automatically creates missing labels and syncs with GitHub.
+
+  Usage:
+    todo-sync label <issue-id> "label1, label2, label3" [options]
+
+  Options:
+    --todo FILE    Path to TODO.md (default: TODO.md)
+
+  Example:
+    todo-sync label 42 "bug, urgent"
+    todo-sync label 42 "feature, documentation, backend"
+    todo-sync label 42 ""    # Clear all labels
+""",
+        "labels": """
+  labels — List all available labels in the repository
+
+  Shows all labels available in the GitHub repository. Useful for checking what
+  labels exist before assigning them to issues.
+
+  Usage:
+    todo-sync labels
+
+  Example:
+    todo-sync labels
+""",
         "add": """
   add — Create a new GitHub issue and add it to TODO.md
 
@@ -1193,6 +1423,8 @@ def cmd_help(args) -> None:
     comment  Add a comment to an issue
     assign   Assign an issue to yourself
     update   Update an existing issue
+    label    Set labels for an issue
+    labels   List available labels in the repo
     remove   Remove an issue from TODO.md
     help     Show help for a command
 
@@ -1240,6 +1472,11 @@ def main() -> None:
         "--todo",
         default="TODO.md",
         help="Path to TODO.md (default: TODO.md)"
+    )
+    init_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing TODO.md"
     )
     init_parser.add_argument("-h", "--help", action="store_true")
 
@@ -1394,6 +1631,36 @@ def main() -> None:
     )
     update_parser.add_argument("-h", "--help", action="store_true")
 
+    # label
+    label_parser = subparsers.add_parser(
+        "label",
+        help="Set labels for an issue",
+        add_help=False
+    )
+    label_parser.add_argument(
+        "issue_id",
+        type=int,
+        help="Issue number"
+    )
+    label_parser.add_argument(
+        "labels",
+        help="Comma-separated list of labels (e.g. 'bug, urgent, feature')"
+    )
+    label_parser.add_argument(
+        "--todo",
+        default="TODO.md",
+        help="Path to TODO.md (default: TODO.md)"
+    )
+    label_parser.add_argument("-h", "--help", action="store_true")
+
+    # labels
+    labels_parser = subparsers.add_parser(
+        "labels",
+        help="List available labels in the repo",
+        add_help=False
+    )
+    labels_parser.add_argument("-h", "--help", action="store_true")
+
     # remove
     remove_parser = subparsers.add_parser(
         "remove",
@@ -1453,6 +1720,8 @@ def main() -> None:
         "comment": cmd_comment,
         "assign": cmd_assign,
         "update": cmd_update,
+        "label": cmd_label,
+        "labels": cmd_labels,
         "remove": cmd_remove,
         "help": lambda a: cmd_help(
             argparse.Namespace(command=getattr(a, 'help_command', None))
