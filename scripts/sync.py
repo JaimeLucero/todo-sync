@@ -1506,7 +1506,7 @@ def main() -> None:
     parser.add_argument(
         "--version",
         action="version",
-        version="todo-sync 1.2.0"
+        version="todo-sync 1.2.1"
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
