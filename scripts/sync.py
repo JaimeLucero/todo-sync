@@ -734,8 +734,8 @@ class SyncEngine:
                                 self.github.edit_issue(item.issue_id, title=item.text)
                                 self._log("UPDATED", f"Issue #{item.issue_id}: title synced")
 
-                    # Sync labels: compare and update
-                    if not self.dry_run:
+                    # Sync labels: only when TODO.md item explicitly declares labels
+                    if not self.dry_run and item.labels:
                         current_labels = self.github.get_issue_labels(item.issue_id)
                         labels_to_add = [l for l in item.labels if l not in current_labels]
                         labels_to_remove = [l for l in current_labels if l not in item.labels]
@@ -1144,6 +1144,42 @@ def cmd_labels(args) -> None:
         sys.exit(1)
 
 
+def cmd_list(args) -> None:
+    """List tickets with their issue numbers."""
+    try:
+        parser = TodoParser(args.todo)
+        items = parser.load()
+
+        # Separate by section and checked status
+        open_items = [i for i in items if i.section == "open" and not i.checked]
+        done_items = [i for i in items if i.section == "done" or i.checked]
+
+        # Filter based on --all flag
+        if not args.all:
+            done_items = []
+
+        def print_section(title, section_items):
+            if not section_items:
+                return
+            print(f"{title} ({len(section_items)})")
+            for item in section_items:
+                num = f"#{item.issue_id}" if item.issue_id else "(unsynced)"
+                # Pad number column to keep titles aligned
+                print(f"  {num:<12} {item.text}")
+            print()
+
+        print_section("Open", open_items)
+        if done_items:
+            print_section("Done", done_items)
+
+        if not open_items and not done_items:
+            print("No tickets found.")
+
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_add(args) -> None:
     """Add a new ticket to GitHub and TODO.md."""
     try:
@@ -1379,6 +1415,23 @@ def cmd_help(args) -> None:
   Example:
     todo-sync labels
 """,
+        "list": """
+  list — List open tickets with their issue numbers
+
+  Show all open tickets so you can find issue numbers for other commands
+  (comment, assign, label, etc.).
+
+  Usage:
+    todo-sync list [options]
+
+  Options:
+    --all       Also show completed (done) tickets
+    --todo FILE Path to TODO.md (default: TODO.md)
+
+  Example:
+    todo-sync list
+    todo-sync list --all
+""",
         "add": """
   add — Create a new GitHub issue and add it to TODO.md
 
@@ -1420,6 +1473,7 @@ def cmd_help(args) -> None:
     pull     Pull GitHub Issues → TODO.md
     sync     Bidirectional sync (push + pull)
     add      Create a new ticket
+    list     List open tickets with numbers
     comment  Add a comment to an issue
     assign   Assign an issue to yourself
     update   Update an existing issue
@@ -1661,6 +1715,24 @@ def main() -> None:
     )
     labels_parser.add_argument("-h", "--help", action="store_true")
 
+    # list
+    list_parser = subparsers.add_parser(
+        "list",
+        help="List open tickets with numbers",
+        add_help=False
+    )
+    list_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Also show completed (done) tickets"
+    )
+    list_parser.add_argument(
+        "--todo",
+        default="TODO.md",
+        help="Path to TODO.md (default: TODO.md)"
+    )
+    list_parser.add_argument("-h", "--help", action="store_true")
+
     # remove
     remove_parser = subparsers.add_parser(
         "remove",
@@ -1717,6 +1789,7 @@ def main() -> None:
         "pull": cmd_pull,
         "sync": cmd_sync,
         "add": cmd_add,
+        "list": cmd_list,
         "comment": cmd_comment,
         "assign": cmd_assign,
         "update": cmd_update,
