@@ -28,6 +28,9 @@ class TodoItem:
     description: str = ""  # optional description (multiline context)
     subtasks: list['Subtask'] = dataclasses.field(default_factory=list)  # optional subtasks
     labels: list[str] = dataclasses.field(default_factory=list)  # optional labels for GitHub issues
+    notion_id: str | None = None  # Notion page UUID
+    status: str | None = None  # Notion status: "todo", "assigned", "ongoing", "PR", "staging", "merge", "QA", "done"
+    assigned: str | None = None  # GitHub/Notion assignee (username or name)
 
 
 @dataclasses.dataclass
@@ -44,6 +47,41 @@ class IssueRecord:
     title: str
     state: str  # "open" or "closed"
     body: str = ""  # issue body/description
+    assignee: str | None = None  # login of assigned user
+
+
+# --- Notion Configuration ---
+
+NOTION_CONFIG_FILE = ".todo-sync/notion.json"
+
+
+def load_notion_config() -> dict:
+    """Load Notion credentials from .todo-sync/notion.json.
+    Raises FileNotFoundError if not configured yet.
+    """
+    path = Path(NOTION_CONFIG_FILE)
+    if not path.exists():
+        raise FileNotFoundError(
+            "Notion not configured. Run 'todo-sync notion-setup' first."
+        )
+    with open(path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    if 'token' not in config or 'database_id' not in config:
+        raise ValueError(
+            f"Invalid notion config at {path}. "
+            "Expected keys: 'token', 'database_id'."
+        )
+    return config
+
+
+def save_notion_config(token: str, database_id: str) -> None:
+    """Write Notion credentials to .todo-sync/notion.json."""
+    path = Path(NOTION_CONFIG_FILE)
+    path.parent.mkdir(exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({"token": token, "database_id": database_id}, f, indent=2)
+    # chmod 600 — token is sensitive
+    path.chmod(0o600)
 
 
 class ClaudeClient:
@@ -139,10 +177,16 @@ Return ONLY valid JSON with this structure (no markdown, no code blocks):
 class TodoParser:
     """Parse and write TODO.md files with bidirectional sync support."""
 
-    CHECKBOX_RE = re.compile(r'^- \[([ x])\] (.+?)(?:\s*<!--\s*issue:(\d+)\s*-->)?\s*$')
+    CHECKBOX_RE = re.compile(
+        r'^- \[([ x])\] (.+?)'
+        r'((?:\s*<!--\s*(?:issue:\d+|notion:[A-Za-z0-9_-]+)\s*-->)*)'
+        r'\s*$'
+    )
     SECTION_RE = re.compile(r'^##\s+(.+)$')
     DESCRIPTION_RE = re.compile(r'^\s+>\s(.*)$')  # indented > for description
     LABELS_RE = re.compile(r'^\s+labels:\s*(.+?)\s*$')  # indented labels metadata
+    STATUS_RE = re.compile(r'^\s+status:\s*(.+?)\s*$')  # indented status metadata (Notion)
+    ASSIGNED_RE = re.compile(r'^\s+assigned:\s*(.+?)\s*$')  # indented assigned metadata (GitHub/Notion assignee)
     SUBTASK_RE = re.compile(r'^\s+- \[([ x])\] (.+)$')  # indented subtask
 
     def __init__(self, path: str):
@@ -198,12 +242,19 @@ class TodoParser:
             if checkbox_match:
                 checked = checkbox_match.group(1) == 'x'
                 text = checkbox_match.group(2)
-                issue_id = int(checkbox_match.group(3)) if checkbox_match.group(3) else None
+                # Extract issue_id and notion_id from the suffix block (group 3)
+                suffix = checkbox_match.group(3)
+                issue_match = re.search(r'<!--\s*issue:(\d+)\s*-->', suffix)
+                notion_match = re.search(r'<!--\s*notion:([A-Za-z0-9_-]+)\s*-->', suffix)
+                issue_id = int(issue_match.group(1)) if issue_match else None
+                notion_id = notion_match.group(1) if notion_match else None
                 item_line_index = idx
 
-                # Collect description, labels, and subtasks
+                # Collect description, labels, status, assigned, and subtasks
                 description_lines = []
                 labels = []
+                status = None
+                assigned = None
                 subtasks = []
                 idx += 1
 
@@ -226,6 +277,20 @@ class TodoParser:
                         idx += 1
                         continue
 
+                    # Check for status line (Notion status metadata)
+                    status_match = self.STATUS_RE.match(next_line)
+                    if status_match:
+                        status = status_match.group(1).strip()
+                        idx += 1
+                        continue
+
+                    # Check for assigned line (GitHub/Notion assignee metadata)
+                    assigned_match = self.ASSIGNED_RE.match(next_line)
+                    if assigned_match:
+                        assigned = assigned_match.group(1).strip()
+                        idx += 1
+                        continue
+
                     # Check for subtask line
                     subtask_match = self.SUBTASK_RE.match(next_line)
                     if subtask_match:
@@ -235,7 +300,7 @@ class TodoParser:
                         idx += 1
                         continue
 
-                    # Not a description, labels, or subtask, break out
+                    # Not a description, labels, status, assigned, or subtask, break out
                     break
 
                 items.append(TodoItem(
@@ -246,7 +311,10 @@ class TodoParser:
                     section=current_section or "unknown",
                     description='\n'.join(description_lines),
                     subtasks=subtasks,
-                    labels=labels
+                    labels=labels,
+                    notion_id=notion_id,
+                    status=status,
+                    assigned=assigned
                 ))
             else:
                 idx += 1
@@ -281,8 +349,8 @@ class TodoParser:
                     item_idx += 1
                 else:
                     new_lines.append(line)
-            elif self.DESCRIPTION_RE.match(line) or self.LABELS_RE.match(line) or self.SUBTASK_RE.match(line):
-                # Skip old description/labels/subtask lines; they'll be rewritten with the item
+            elif self.DESCRIPTION_RE.match(line) or self.LABELS_RE.match(line) or self.STATUS_RE.match(line) or self.ASSIGNED_RE.match(line) or self.SUBTASK_RE.match(line):
+                # Skip old description/labels/status/assigned/subtask lines; they'll be rewritten with the item
                 pass
             else:
                 # Keep other lines as-is
@@ -319,10 +387,12 @@ class TodoParser:
             # If it's a checkbox, update insert position
             if self.CHECKBOX_RE.match(line):
                 insert_idx = i + 1
-                # Skip past any description/labels/subtask lines
+                # Skip past any description/labels/status/assigned/subtask lines
                 while insert_idx < len(self._lines) and (
                     self.DESCRIPTION_RE.match(self._lines[insert_idx]) or
                     self.LABELS_RE.match(self._lines[insert_idx]) or
+                    self.STATUS_RE.match(self._lines[insert_idx]) or
+                    self.ASSIGNED_RE.match(self._lines[insert_idx]) or
                     self.SUBTASK_RE.match(self._lines[insert_idx])
                 ):
                     insert_idx += 1
@@ -352,10 +422,10 @@ class TodoParser:
         checkbox_line = item_to_remove.line_index
         remove_count = 1  # Count the checkbox line itself
 
-        # Count how many description, labels, and subtask lines follow
+        # Count how many description, labels, status, assigned, and subtask lines follow
         if checkbox_line + 1 < len(self._lines):
             for i in range(checkbox_line + 1, len(self._lines)):
-                if self.DESCRIPTION_RE.match(self._lines[i]) or self.LABELS_RE.match(self._lines[i]) or self.SUBTASK_RE.match(self._lines[i]):
+                if self.DESCRIPTION_RE.match(self._lines[i]) or self.LABELS_RE.match(self._lines[i]) or self.STATUS_RE.match(self._lines[i]) or self.ASSIGNED_RE.match(self._lines[i]) or self.SUBTASK_RE.match(self._lines[i]):
                     remove_count += 1
                 else:
                     break
@@ -400,25 +470,35 @@ class TodoParser:
         return item
 
     @staticmethod
-    def _format_line(checked: bool, text: str, issue_id: int | None) -> str:
+    def _format_line(checked: bool, text: str, issue_id: int | None, notion_id: str | None = None) -> str:
         """Format a checkbox line."""
         checkbox = '[x]' if checked else '[ ]'
         line = f"- {checkbox} {text}"
         if issue_id is not None:
             line += f" <!-- issue:{issue_id} -->"
+        if notion_id is not None:
+            line += f" <!-- notion:{notion_id} -->"
         return line
 
     @staticmethod
     def _format_item_lines(item: TodoItem) -> list[str]:
-        """Format a TodoItem as multiple lines (checkbox, description, labels, subtasks)."""
+        """Format a TodoItem as multiple lines (checkbox, description, status, assigned, labels, subtasks)."""
         lines = []
         # Format checkbox line
-        lines.append(TodoParser._format_line(item.checked, item.text, item.issue_id))
+        lines.append(TodoParser._format_line(item.checked, item.text, item.issue_id, item.notion_id))
 
         # Format description lines
         if item.description:
             for desc_line in item.description.split('\n'):
                 lines.append(f"  > {desc_line}")
+
+        # Format status line (Notion)
+        if item.status:
+            lines.append(f"  status: {item.status}")
+
+        # Format assigned line (GitHub/Notion)
+        if item.assigned:
+            lines.append(f"  assigned: {item.assigned}")
 
         # Format labels line
         if item.labels:
@@ -473,7 +553,7 @@ class GitHubClient:
                 "issue", "list",
                 "--state", "all",
                 "--limit", "500",
-                "--json", "number,title,state"
+                "--json", "number,title,state,assignees"
             )
         except GitHubError as e:
             raise GitHubError(f"Failed to fetch issues: {e}")
@@ -483,10 +563,17 @@ class GitHubClient:
             issues = []
             for item in data:
                 try:
+                    # Extract assignee login if assigned (GitHub returns assignees array)
+                    assignee = None
+                    assignees = item.get("assignees", [])
+                    if assignees and len(assignees) > 0:
+                        assignee = assignees[0].get("login")
+
                     issues.append(IssueRecord(
                         number=item["number"],
                         title=item["title"],
-                        state=item["state"].lower()
+                        state=item["state"].lower(),
+                        assignee=assignee
                     ))
                 except (KeyError, ValueError):
                     pass  # Skip malformed items
@@ -657,6 +744,191 @@ class GitHubClient:
                 raise GitHubError(f"Failed to create label '{name}': {e}")
 
 
+class NotionError(Exception):
+    """Notion API operation failed."""
+    pass
+
+
+class NotionClient:
+    """Interact with Notion API using stdlib urllib (no external dependencies)."""
+
+    BASE_URL = "https://api.notion.com/v1"
+    NOTION_VERSION = "2022-06-28"
+    VALID_STATUSES = {"todo", "assigned", "ongoing", "PR", "staging", "merge", "QA", "done"}
+
+    def __init__(self, token: str):
+        self.token = token
+        self._headers = {
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": self.NOTION_VERSION,
+            "Content-Type": "application/json",
+        }
+
+    def _request(self, method: str, path: str, body: dict | None = None) -> dict:
+        """Make an HTTP request to the Notion API."""
+        url = f"{self.BASE_URL}/{path}"
+        data = json.dumps(body).encode('utf-8') if body is not None else None
+        req = urllib.request.Request(url, data=data, headers=self._headers, method=method)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8')
+            raise NotionError(f"Notion API {method} {path} failed: {e.code} {error_body}")
+        except urllib.error.URLError as e:
+            raise NotionError(f"Network error contacting Notion: {e}")
+        except json.JSONDecodeError as e:
+            raise NotionError(f"Failed to parse Notion API response: {e}")
+
+    @staticmethod
+    def _rich_text(value: str) -> list[dict]:
+        """Build a Notion rich_text array from a plain string."""
+        # Notion rich_text blocks cap at 2000 chars each
+        return [{"type": "text", "text": {"content": value[:2000]}}]
+
+    @staticmethod
+    def _extract_plain_text(rich_text_array: list[dict]) -> str:
+        """Extract plain text from a Notion rich_text array."""
+        return "".join(
+            block.get("plain_text", "") for block in rich_text_array
+        )
+
+    @staticmethod
+    def _serialize_subtasks(subtasks: list[Subtask]) -> str:
+        """Serialize subtasks to plain-text format for Notion storage."""
+        lines = []
+        for s in subtasks:
+            mark = "[x]" if s.checked else "[ ]"
+            lines.append(f"- {mark} {s.text}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _deserialize_subtasks(text: str) -> list[Subtask]:
+        """Deserialize subtasks from plain-text format stored in Notion."""
+        subtasks = []
+        pattern = re.compile(r'^- \[([ x])\] (.+)$')
+        for line in text.split('\n'):
+            m = pattern.match(line.strip())
+            if m:
+                subtasks.append(Subtask(text=m.group(2), checked=m.group(1) == 'x'))
+        return subtasks
+
+    def _build_properties(
+        self, title: str, status: str | None, description: str,
+        subtasks: list[Subtask], github_issue: int | None,
+        labels: list[str] | None = None, checked: bool = False
+    ) -> dict:
+        """Build the Notion page properties payload."""
+        props: dict = {
+            "Name": {"title": self._rich_text(title)},
+            "Description": {"rich_text": self._rich_text(description)},
+            "Subtasks": {"rich_text": self._rich_text(self._serialize_subtasks(subtasks))},
+            "Checked": {"checkbox": checked},
+        }
+        if status and status in self.VALID_STATUSES:
+            props["Status"] = {"select": {"name": status}}
+        if github_issue is not None:
+            props["GitHubIssue"] = {"number": github_issue}
+        if labels is not None:
+            props["Labels"] = {"rich_text": self._rich_text(", ".join(labels))}
+        return props
+
+    def create_page(
+        self, database_id: str, title: str, status: str | None,
+        description: str, subtasks: list[Subtask],
+        github_issue: int | None, labels: list[str] | None = None,
+        checked: bool = False
+    ) -> str:
+        """Create a new page in the Notion database. Returns the new page's ID."""
+        body = {
+            "parent": {"database_id": database_id},
+            "properties": self._build_properties(
+                title, status, description, subtasks,
+                github_issue, labels, checked
+            )
+        }
+        result = self._request("POST", "pages", body)
+        return result["id"]
+
+    def update_page(
+        self, page_id: str, title: str | None = None,
+        status: str | None = None, description: str | None = None,
+        subtasks: list[Subtask] | None = None,
+        labels: list[str] | None = None, checked: bool | None = None
+    ) -> None:
+        """Update an existing Notion page's properties."""
+        props: dict = {}
+        if title is not None:
+            props["Name"] = {"title": self._rich_text(title)}
+        if status is not None and status in self.VALID_STATUSES:
+            props["Status"] = {"select": {"name": status}}
+        if description is not None:
+            props["Description"] = {"rich_text": self._rich_text(description)}
+        if subtasks is not None:
+            props["Subtasks"] = {"rich_text": self._rich_text(
+                self._serialize_subtasks(subtasks)
+            )}
+        if labels is not None:
+            props["Labels"] = {"rich_text": self._rich_text(", ".join(labels))}
+        if checked is not None:
+            props["Checked"] = {"checkbox": checked}
+        if props:
+            self._request("PATCH", f"pages/{page_id}", {"properties": props})
+
+    def query_database(self, database_id: str) -> list[dict]:
+        """Return all pages from the Notion database. Handles pagination."""
+        pages = []
+        body: dict = {"page_size": 100}
+        while True:
+            result = self._request("POST", f"databases/{database_id}/query", body)
+            pages.extend(result.get("results", []))
+            if not result.get("has_more"):
+                break
+            body["start_cursor"] = result["next_cursor"]
+        return pages
+
+    def fetch_page(self, page_id: str) -> dict:
+        """Fetch a single Notion page's full properties."""
+        return self._request("GET", f"pages/{page_id}")
+
+    def extract_item_from_page(self, page: dict) -> dict:
+        """Extract structured dict from a raw Notion page object."""
+        props = page.get("properties", {})
+
+        title_blocks = props.get("Name", {}).get("title", [])
+        title = self._extract_plain_text(title_blocks)
+
+        status_select = props.get("Status", {}).get("select")
+        status = status_select.get("name") if status_select else None
+
+        desc_blocks = props.get("Description", {}).get("rich_text", [])
+        description = self._extract_plain_text(desc_blocks)
+
+        subtask_blocks = props.get("Subtasks", {}).get("rich_text", [])
+        subtask_text = self._extract_plain_text(subtask_blocks)
+        subtasks = self._deserialize_subtasks(subtask_text)
+
+        github_issue_raw = props.get("GitHubIssue", {}).get("number")
+        github_issue = int(github_issue_raw) if github_issue_raw is not None else None
+
+        label_blocks = props.get("Labels", {}).get("rich_text", [])
+        label_text = self._extract_plain_text(label_blocks)
+        labels = [l.strip() for l in label_text.split(",") if l.strip()]
+
+        checked = props.get("Checked", {}).get("checkbox", False)
+
+        return {
+            "notion_id": page["id"],
+            "title": title,
+            "status": status,
+            "description": description,
+            "subtasks": subtasks,
+            "github_issue": github_issue,
+            "labels": labels,
+            "checked": checked,
+        }
+
+
 class SyncEngine:
     """Orchestrate bidirectional sync between TODO.md and GitHub Issues."""
 
@@ -821,6 +1093,15 @@ class SyncEngine:
                             item.labels = gh_labels
                             self._log("UPDATED", f"Issue #{issue.number}: labels synced from GitHub")
 
+                    # Sync assignee from GitHub
+                    if not self.dry_run:
+                        if issue.assignee != item.assigned:
+                            item.assigned = issue.assignee
+                            if issue.assignee:
+                                self._log("UPDATED", f"Issue #{issue.number}: assigned to {issue.assignee}")
+                            else:
+                                self._log("UPDATED", f"Issue #{issue.number}: assignee cleared")
+
                     # Issue closed, item unchecked: check it
                     if issue.state == "closed" and not item.checked:
                         if self.dry_run:
@@ -899,6 +1180,169 @@ class SyncEngine:
 
     def print_summary(self) -> None:
         """Print summary of all changes."""
+        if not self._changelog:
+            print("No changes.")
+
+
+class NotionSyncEngine:
+    """Orchestrate sync between TODO.md and a Notion database."""
+
+    def __init__(self, todo_path: str, notion: NotionClient,
+                 database_id: str, dry_run: bool = False):
+        self.parser = TodoParser(todo_path)
+        self.notion = notion
+        self.database_id = database_id
+        self.dry_run = dry_run
+        self._changelog: list[str] = []
+
+    def push(self) -> None:
+        """Push TODO.md items → Notion database."""
+        items = self.parser.load()
+        changed = False
+
+        for item in items:
+            try:
+                if item.notion_id is None:
+                    # Determine initial status from item
+                    initial_status = self._infer_status(item)
+                    if self.dry_run:
+                        self._log("CREATE", f"Notion page for '{item.text}'")
+                    else:
+                        page_id = self.notion.create_page(
+                            self.database_id,
+                            title=item.text,
+                            status=initial_status,
+                            description=item.description,
+                            subtasks=item.subtasks,
+                            github_issue=item.issue_id,
+                            labels=item.labels,
+                            checked=item.checked,
+                        )
+                        item.notion_id = page_id
+                        item.status = initial_status
+                        changed = True
+                        self._log("CREATED", f"Notion page {page_id[:8]}... for '{item.text}'")
+                else:
+                    if self.dry_run:
+                        self._log("UPDATE", f"Notion page for '{item.text}'")
+                    else:
+                        self.notion.update_page(
+                            item.notion_id,
+                            title=item.text,
+                            description=item.description,
+                            subtasks=item.subtasks,
+                            labels=item.labels,
+                            checked=item.checked,
+                            # Do NOT overwrite status on push — Notion is authoritative for status
+                        )
+                        self._log("UPDATED", f"Notion page {item.notion_id[:8]}... for '{item.text}'")
+            except NotionError as e:
+                self._log("ERROR", f"Failed to push '{item.text}': {e}")
+
+        if not self.dry_run and changed:
+            self.parser.write_back(items)
+        self.print_summary()
+
+    def pull(self) -> None:
+        """Pull Notion database → TODO.md."""
+        items = self.parser.load()
+        pages = self.notion.query_database(self.database_id)
+
+        notion_id_map = {item.notion_id: item for item in items if item.notion_id}
+        issue_id_map = {item.issue_id: item for item in items if item.issue_id}
+        changed = False
+
+        for page in pages:
+            try:
+                pd = self.notion.extract_item_from_page(page)
+                notion_id = pd["notion_id"]
+
+                # Try to match by notion_id first, then github_issue
+                matched_item = notion_id_map.get(notion_id)
+                if matched_item is None and pd["github_issue"] is not None:
+                    matched_item = issue_id_map.get(pd["github_issue"])
+
+                if matched_item is not None:
+                    # Update local item from Notion
+                    if self.dry_run:
+                        self._log("UPDATE", f"'{matched_item.text}' from Notion")
+                    else:
+                        # Status is always pulled from Notion (Notion is authoritative)
+                        if pd["status"] and pd["status"] != matched_item.status:
+                            matched_item.status = pd["status"]
+                            changed = True
+                            self._log("UPDATED", f"'{matched_item.text}': status → {pd['status']}")
+                        # Title sync
+                        if pd["title"] and pd["title"] != matched_item.text:
+                            matched_item.text = pd["title"]
+                            changed = True
+                            self._log("UPDATED", f"Title → '{pd['title']}'")
+                        # Description sync
+                        if pd["description"] != matched_item.description:
+                            matched_item.description = pd["description"]
+                            changed = True
+                        # Stamp notion_id if matched via github_issue
+                        if matched_item.notion_id is None:
+                            matched_item.notion_id = notion_id
+                            changed = True
+                else:
+                    # New page from Notion — append to TODO.md
+                    if self.dry_run:
+                        self._log("APPEND", f"New Notion item: '{pd['title']}'")
+                    else:
+                        new_item = TodoItem(
+                            text=pd["title"],
+                            checked=pd["checked"],
+                            issue_id=pd["github_issue"],
+                            line_index=-1,
+                            section="open" if not pd["checked"] else "done",
+                            description=pd["description"],
+                            subtasks=pd["subtasks"],
+                            labels=pd["labels"],
+                            notion_id=notion_id,
+                            status=pd["status"],
+                        )
+                        # Append the item
+                        self.parser.append_item(
+                            new_item.section, new_item.text,
+                            new_item.issue_id if new_item.issue_id is not None else 0,
+                            new_item.description, new_item.subtasks
+                        )
+                        # Reload and patch notion_id/status via write_back
+                        items = self.parser.load()
+                        for i in items:
+                            if i.text == new_item.text and i.notion_id is None:
+                                i.notion_id = notion_id
+                                i.status = pd["status"]
+                        changed = True
+                        self._log("APPENDED", f"'{pd['title']}' from Notion")
+            except NotionError as e:
+                self._log("ERROR", f"Failed to pull Notion page {page.get('id', '?')}: {e}")
+
+        if not self.dry_run and changed:
+            self.parser.write_back(items)
+        self.print_summary()
+
+    def sync(self) -> None:
+        """Bidirectional sync: push then pull."""
+        self.push()
+        self.pull()
+
+    @staticmethod
+    def _infer_status(item: TodoItem) -> str:
+        """Infer initial Notion status from a TODO.md item that has no status yet."""
+        if item.status:
+            return item.status
+        if item.checked:
+            return "done"
+        return "todo"
+
+    def _log(self, action: str, detail: str) -> None:
+        msg = f"[{action}] {detail}"
+        self._changelog.append(msg)
+        print(msg)
+
+    def print_summary(self) -> None:
         if not self._changelog:
             print("No changes.")
 
@@ -1246,6 +1690,91 @@ def cmd_add(args) -> None:
         sys.exit(1)
 
 
+def cmd_notion_setup(args) -> None:
+    """Prompt for Notion credentials and save to .todo-sync/notion.json."""
+    print("Notion Setup")
+    print("You need a Notion integration token and a database ID.")
+    print("1. Create an integration at https://www.notion.so/my-integrations")
+    print("2. Share your database with the integration.")
+    print()
+
+    token = input("Notion integration token (secret_...): ").strip()
+    if not token:
+        print("Error: Token cannot be empty", file=sys.stderr)
+        sys.exit(1)
+
+    database_id = input("Notion database ID (32-char hex or full URL): ").strip()
+    # Accept full URL and extract the ID
+    if database_id.startswith("https://"):
+        # URL format: https://www.notion.so/.../<id>?v=...
+        parts = database_id.split("/")
+        raw_id = parts[-1].split("?")[0]
+        # Remove dashes if present, then reformat
+        database_id = raw_id.replace("-", "")
+    if not database_id:
+        print("Error: Database ID cannot be empty", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        save_notion_config(token, database_id)
+        print(f"Notion config saved to {NOTION_CONFIG_FILE}")
+        print("Run 'todo-sync notion-push' to push your TODO.md to Notion.")
+    except OSError as e:
+        print(f"Error saving config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_notion_push(args) -> None:
+    """Push TODO.md items → Notion database."""
+    try:
+        config = load_notion_config()
+        notion = NotionClient(config["token"])
+        engine = NotionSyncEngine(
+            args.todo, notion, config["database_id"], dry_run=args.dry_run
+        )
+        engine.push()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except NotionError as e:
+        print(f"Notion error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_notion_pull(args) -> None:
+    """Pull Notion database → TODO.md."""
+    try:
+        config = load_notion_config()
+        notion = NotionClient(config["token"])
+        engine = NotionSyncEngine(
+            args.todo, notion, config["database_id"], dry_run=args.dry_run
+        )
+        engine.pull()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except NotionError as e:
+        print(f"Notion error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_notion_sync(args) -> None:
+    """Bidirectional sync: TODO.md <-> Notion."""
+    try:
+        config = load_notion_config()
+        notion = NotionClient(config["token"])
+        engine = NotionSyncEngine(
+            args.todo, notion, config["database_id"], dry_run=args.dry_run
+        )
+        engine.sync()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except NotionError as e:
+        print(f"Notion error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_help(args) -> None:
     """Show help for a command."""
     commands_help = {
@@ -1454,6 +1983,78 @@ def cmd_help(args) -> None:
     todo-sync add "Update API docs" --description "Add new endpoints" --subtask "Document auth" --subtask "Add examples"
     todo-sync add --generate "Build a user dashboard with real-time stats and export to PDF"
 """,
+        "notion-setup": """
+  notion-setup — Configure Notion integration
+
+  Sets up the Notion API token and database ID for syncing. Stores credentials
+  securely in .todo-sync/notion.json (with restricted permissions).
+
+  Usage:
+    todo-sync notion-setup
+
+  Instructions:
+    1. Create an integration at https://www.notion.so/my-integrations
+    2. Share your Notion database with the integration
+    3. Run this command and enter your token and database ID
+
+  Example:
+    todo-sync notion-setup
+""",
+        "notion-push": """
+  notion-push — Push TODO.md items to Notion database
+
+  Syncs TODO.md tasks to a Notion database in one direction:
+  - Unchecked items without a Notion page ID create new Notion pages
+  - Updates existing pages with latest title, description, and subtasks
+  - Does NOT overwrite the Status field in Notion (PM controls status)
+
+  Usage:
+    todo-sync notion-push [options]
+
+  Options:
+    --todo FILE    Path to TODO.md (default: TODO.md)
+    --dry-run      Preview changes without making them
+
+  Example:
+    todo-sync notion-push
+    todo-sync notion-push --dry-run
+""",
+        "notion-pull": """
+  notion-pull — Pull Notion database to TODO.md
+
+  Syncs a Notion database to TODO.md in one direction:
+  - Updates TODO.md items with status, title, and description from Notion
+  - New Notion pages are appended to TODO.md
+  - Notion is authoritative for the Status field
+
+  Usage:
+    todo-sync notion-pull [options]
+
+  Options:
+    --todo FILE    Path to TODO.md (default: TODO.md)
+    --dry-run      Preview changes without making them
+
+  Example:
+    todo-sync notion-pull
+    todo-sync notion-pull --dry-run
+""",
+        "notion-sync": """
+  notion-sync — Bidirectional sync between TODO.md and Notion
+
+  Two-way sync: performs a push first (TODO.md → Notion), then a pull
+  (Notion → TODO.md). Local TODO.md content wins; Notion status wins.
+
+  Usage:
+    todo-sync notion-sync [options]
+
+  Options:
+    --todo FILE    Path to TODO.md (default: TODO.md)
+    --dry-run      Preview changes without making them
+
+  Example:
+    todo-sync notion-sync
+    todo-sync notion-sync --dry-run
+""",
     }
 
     command = args.command if hasattr(args, 'command') else None
@@ -1468,19 +2069,23 @@ def cmd_help(args) -> None:
     todo-sync <command> [options]
 
   Commands:
-    init     Set up TODO.md in the current repo
-    push     Push TODO.md tasks → GitHub Issues
-    pull     Pull GitHub Issues → TODO.md
-    sync     Bidirectional sync (push + pull)
-    add      Create a new ticket
-    list     List open tickets with numbers
-    comment  Add a comment to an issue
-    assign   Assign an issue to yourself
-    update   Update an existing issue
-    label    Set labels for an issue
-    labels   List available labels in the repo
-    remove   Remove an issue from TODO.md
-    help     Show help for a command
+    init          Set up TODO.md in the current repo
+    push          Push TODO.md tasks → GitHub Issues
+    pull          Pull GitHub Issues → TODO.md
+    sync          Bidirectional sync (push + pull)
+    add           Create a new ticket
+    list          List open tickets with numbers
+    comment       Add a comment to an issue
+    assign        Assign an issue to yourself
+    update        Update an existing issue
+    label         Set labels for an issue
+    labels        List available labels in the repo
+    remove        Remove an issue from TODO.md
+    notion-setup  Configure Notion integration
+    notion-push   Push TODO.md → Notion database
+    notion-pull   Pull Notion database → TODO.md
+    notion-sync   Bidirectional sync TODO.md ↔ Notion
+    help          Show help for a command
 
   Run 'todo-sync help <command>' for details on a specific command.
 
@@ -1506,7 +2111,7 @@ def main() -> None:
     parser.add_argument(
         "--version",
         action="version",
-        version="todo-sync 1.2.1"
+        version="todo-sync 1.3.0"
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -1756,6 +2361,68 @@ def main() -> None:
     )
     remove_parser.add_argument("-h", "--help", action="store_true")
 
+    # notion-setup
+    notion_setup_parser = subparsers.add_parser(
+        "notion-setup",
+        help="Configure Notion integration",
+        add_help=False
+    )
+    notion_setup_parser.add_argument("-h", "--help", action="store_true")
+
+    # notion-push
+    notion_push_parser = subparsers.add_parser(
+        "notion-push",
+        help="Push TODO.md → Notion database",
+        add_help=False
+    )
+    notion_push_parser.add_argument(
+        "--todo",
+        default="TODO.md",
+        help="Path to TODO.md (default: TODO.md)"
+    )
+    notion_push_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview changes without making them"
+    )
+    notion_push_parser.add_argument("-h", "--help", action="store_true")
+
+    # notion-pull
+    notion_pull_parser = subparsers.add_parser(
+        "notion-pull",
+        help="Pull Notion database → TODO.md",
+        add_help=False
+    )
+    notion_pull_parser.add_argument(
+        "--todo",
+        default="TODO.md",
+        help="Path to TODO.md (default: TODO.md)"
+    )
+    notion_pull_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview changes without making them"
+    )
+    notion_pull_parser.add_argument("-h", "--help", action="store_true")
+
+    # notion-sync
+    notion_sync_parser = subparsers.add_parser(
+        "notion-sync",
+        help="Bidirectional sync TODO.md ↔ Notion",
+        add_help=False
+    )
+    notion_sync_parser.add_argument(
+        "--todo",
+        default="TODO.md",
+        help="Path to TODO.md (default: TODO.md)"
+    )
+    notion_sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview changes without making them"
+    )
+    notion_sync_parser.add_argument("-h", "--help", action="store_true")
+
     # help
     help_parser = subparsers.add_parser(
         "help",
@@ -1796,6 +2463,10 @@ def main() -> None:
         "label": cmd_label,
         "labels": cmd_labels,
         "remove": cmd_remove,
+        "notion-setup": cmd_notion_setup,
+        "notion-push": cmd_notion_push,
+        "notion-pull": cmd_notion_pull,
+        "notion-sync": cmd_notion_sync,
         "help": lambda a: cmd_help(
             argparse.Namespace(command=getattr(a, 'help_command', None))
         ),
